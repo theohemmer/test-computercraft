@@ -13,18 +13,18 @@ local CONFIG = {
 
     -- Peripheral names (all configurable)
     PERIPHERALS = {
-        raw_books = "raw_books",
-        available_books = "available_books",
-        input_raw_books = "input_raw_books",
-        printed_books = "printed_books",
-        output_books = "output_books",
-        input_book = "input_book",
+        raw_books = "minecraft:chest_6",
+        available_books = "minecraft:chest_1",
+        input_raw_books = "minecraft:chest_4",
+        printed_books = "minecraft:chest_2",
+        output_books = "minecraft:chest_5",
+        input_book = "minecraft:chest_0",
 
-        fluid_tank = "fluid_tank",
-        printer = "printer",
+        fluid_tank = "create:fluid_tank_1",
+        printer = "create_enchantment_industry:printer_0",
 
-        monitor = "monitor",
-        redstone_relay = "redstone_relay"
+        monitor = "monitor_1",
+        redstone_relay = "redstone_relay_0"
     },
 
     -- Main fluid tank

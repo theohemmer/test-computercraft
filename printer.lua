@@ -1,422 +1,674 @@
 
---================================================
--- CREATE: ENCHANTMENT INDUSTRY PRINTER CONTROLLER
--- CC:Tweaked / Arcadia V2
---================================================
+--------------------------------------------------
+-- CREATE BOOK PRINTING STATION
+-- ComputerCraft: Tweaked
+-- Advanced Monitor + Create Printer
+--------------------------------------------------
+
+--------------------------------------------------
+-- CONFIGURATION
+--------------------------------------------------
 
 local CONFIG = {
-    chest = "left",
-    deployer = "create_deployer_0",
-    tank = "create_fluid_tank_0",
-    printer = "back",
-    monitor = "monitor_0",
 
-    minimumFluid = 2000,
-    refreshRate = 1,
-    monitorScale = 0.5
+    -- Peripheral names (all configurable)
+    PERIPHERALS = {
+        raw_books = "raw_books",
+        available_books = "available_books",
+        input_raw_books = "input_raw_books",
+        printed_books = "printed_books",
+        output_books = "output_books",
+        input_book = "input_book",
+
+        fluid_tank = "fluid_tank",
+        printer = "printer",
+
+        monitor = "monitor",
+        redstone_relay = "redstone_relay"
+    },
+
+    -- Main fluid tank
+    FLUID_TANK_CAPACITY_MB = 64000,
+    MIN_MAIN_FLUID_MB = 10000,
+
+    -- Printer fluid
+    MIN_PRINTER_FLUID_MB = 500,
+
+    -- Production
+    SECONDS_PER_BOOK = 3,
+    MAX_BOOKS = 5,
+
+    -- Redstone
+    REDSTONE_SIDE = "left",
+    RESET_DURATION = 3,
+
+    -- Interface
+    MONITOR_SCALE = 0.5,
+    REFRESH_RATE = 0.5,
+
+    -- Number of books displayed at once
+    VISIBLE_BOOKS = 5
 }
 
---================================================
--- PERIPHERALS
---================================================
+--------------------------------------------------
+-- PERIPHERAL INITIALIZATION
+--------------------------------------------------
 
-local chest = peripheral.wrap(CONFIG.chest)
-local deployer = peripheral.wrap(CONFIG.deployer)
-local tank = peripheral.wrap(CONFIG.tank)
-local monitor = peripheral.wrap(CONFIG.monitor)
+local function getPeripheral(configName)
+    local name = CONFIG.PERIPHERALS[configName]
 
--- Printer must use peripheral.call
-local function printerCall(method, ...)
-    return peripheral.call(CONFIG.printer, method, ...)
+    if not name then
+        error("Missing peripheral configuration: " .. configName)
+    end
+
+    local p = peripheral.wrap(name)
+
+    if not p then
+        error("Peripheral not found: " .. name)
+    end
+
+    return p
 end
 
-assert(chest, "Chest not found")
-assert(deployer, "Deployer not found")
-assert(tank, "Tank not found")
-assert(monitor, "Monitor not found")
+local rawBooks = getPeripheral("raw_books")
+local availableBooks = getPeripheral("available_books")
+local inputRawBooks = getPeripheral("input_raw_books")
+local printedBooks = getPeripheral("printed_books")
+local outputBooks = getPeripheral("output_books")
+local inputBook = getPeripheral("input_book")
 
-assert(
-    peripheral.isPresent(CONFIG.printer),
-    "Printer not found"
-)
+local fluidTank = getPeripheral("fluid_tank")
+local printer = getPeripheral("printer")
 
---================================================
--- SCREEN
---================================================
+local monitor = getPeripheral("monitor")
+local relay = getPeripheral("redstone_relay")
 
-monitor.setTextScale(CONFIG.monitorScale)
+--------------------------------------------------
+-- PERIPHERAL NAMES
+--------------------------------------------------
+
+local function peripheralName(configName)
+    return CONFIG.PERIPHERALS[configName]
+end
+
+--------------------------------------------------
+-- INITIALIZATION
+--------------------------------------------------
+
+monitor.setTextScale(CONFIG.MONITOR_SCALE)
 
 local W, H = monitor.getSize()
 
-local selected = nil
-local books = {}
-local page = 1
+local selectedBook = nil
+local selectedQuantity = 1
+local scrollOffset = 0
 
-local status = "SYSTEM READY"
-local statusColor = colors.lime
+local status = "READY"
+local message = "Select a book"
 
-local running = true
+local busy = false
+local remainingTime = 0
 
---================================================
--- SCREEN FUNCTIONS
---================================================
+local catalogue = {}
 
-local function writeAt(x, y, message, color, bg)
+--------------------------------------------------
+-- REDSTONE CONTROL
+--------------------------------------------------
+
+local function machineOn()
+    relay.setOutput(CONFIG.REDSTONE_SIDE, true)
+end
+
+local function machineOff()
+    relay.setOutput(CONFIG.REDSTONE_SIDE, false)
+end
+
+-- Always turn ON at startup.
+machineOn()
+
+--------------------------------------------------
+-- INVENTORY FUNCTIONS
+--------------------------------------------------
+
+local function countItems(inventory)
+
+    local total = 0
+
+    for _, item in pairs(inventory.list()) do
+        total = total + item.count
+    end
+
+    return total
+end
+
+local function inventoryEmpty(inventory)
+    return countItems(inventory) == 0
+end
+
+local function moveItems(source, destination, amount)
+
+    local remaining = amount
+    local moved = 0
+
+    local destinationName = peripheralName(
+        destination == rawBooks and "raw_books" or
+        destination == availableBooks and "available_books" or
+        destination == inputRawBooks and "input_raw_books" or
+        destination == printedBooks and "printed_books" or
+        destination == outputBooks and "output_books" or
+        destination == inputBook and "input_book" or
+        ""
+    )
+
+    if destinationName == "" then
+        error("Unknown destination inventory")
+    end
+
+    for slot, item in pairs(source.list()) do
+
+        if remaining <= 0 then
+            break
+        end
+
+        local amountToMove = math.min(
+            item.count,
+            remaining
+        )
+
+        local transferred = source.pushItems(
+            destinationName,
+            slot,
+            amountToMove
+        )
+
+        moved = moved + transferred
+        remaining = remaining - transferred
+    end
+
+    return moved
+end
+
+--------------------------------------------------
+-- FLUID FUNCTIONS
+--------------------------------------------------
+
+local function getFluidAmount(peripheralObject)
+
+    local total = 0
+    local tanks = peripheralObject.tanks()
+
+    if not tanks then
+        return 0
+    end
+
+    for _, tank in pairs(tanks) do
+
+        if tank and tank.amount then
+            total = total + tank.amount
+        end
+
+    end
+
+    return total
+end
+
+local function getMainFluid()
+    return getFluidAmount(fluidTank)
+end
+
+local function getPrinterFluid()
+    return getFluidAmount(printer)
+end
+
+local function getMainPercentage()
+
+    local capacity = CONFIG.FLUID_TANK_CAPACITY_MB
+
+    if capacity <= 0 then
+        return 0
+    end
+
+    return math.floor(
+        getMainFluid() / capacity * 100
+    )
+end
+
+--------------------------------------------------
+-- BOOK IDENTIFICATION
+--------------------------------------------------
+
+local function getFingerprint(detail)
+
+    if not detail then
+        return nil
+    end
+
+    local nbt = ""
+
+    if detail.nbt then
+        nbt = textutils.serialize(detail.nbt)
+    end
+
+    return detail.name .. "|" .. nbt
+end
+
+--------------------------------------------------
+-- BOOK CATALOGUE
+--------------------------------------------------
+
+local function refreshCatalogue()
+
+    local newCatalogue = {}
+    local indexed = {}
+
+    for slot, item in pairs(availableBooks.list()) do
+
+        local detail = availableBooks.getItemDetail(slot)
+
+        if detail then
+
+            local fingerprint = getFingerprint(detail)
+
+            if not indexed[fingerprint] then
+
+                indexed[fingerprint] = {
+                    fingerprint = fingerprint,
+                    name = detail.displayName or detail.name,
+                    itemName = detail.name,
+                    count = 0
+                }
+
+                table.insert(
+                    newCatalogue,
+                    indexed[fingerprint]
+                )
+
+            end
+
+            indexed[fingerprint].count =
+                indexed[fingerprint].count + item.count
+
+        end
+
+    end
+
+    table.sort(newCatalogue, function(a, b)
+        return a.name < b.name
+    end)
+
+    catalogue = newCatalogue
+end
+
+--------------------------------------------------
+-- FIND SELECTED BOOK IN INVENTORY
+--------------------------------------------------
+
+local function findBook(fingerprint)
+
+    for slot, item in pairs(availableBooks.list()) do
+
+        local detail = availableBooks.getItemDetail(slot)
+
+        if detail and getFingerprint(detail) == fingerprint then
+            return slot, item.count
+        end
+
+    end
+
+    return nil, 0
+end
+
+--------------------------------------------------
+-- MONITOR DRAWING
+--------------------------------------------------
+
+local function clearScreen()
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+    monitor.clear()
+end
+
+local function writeAt(x, y, text, fg, bg)
 
     if y < 1 or y > H then
         return
     end
 
+    text = tostring(text)
+
+    if x < 1 then
+        text = text:sub(2 - x)
+        x = 1
+    end
+
+    if x > W then
+        return
+    end
+
+    text = text:sub(1, W - x + 1)
+
     monitor.setCursorPos(x, y)
 
-    monitor.setTextColor(color or colors.white)
+    monitor.setTextColor(fg or colors.white)
     monitor.setBackgroundColor(bg or colors.black)
 
-    monitor.write(
-        string.sub(tostring(message), 1, W - x + 1)
-    )
+    monitor.write(text)
 end
 
-local function center(y, message, color)
+local function centerText(y, text, fg, bg)
 
-    message = tostring(message)
+    local x = math.floor((W - #text) / 2) + 1
 
-    local x = math.max(
+    writeAt(x, y, text, fg, bg)
+end
+
+local function clearLine(y, bg)
+
+    writeAt(
         1,
-        math.floor((W - #message) / 2) + 1
+        y,
+        string.rep(" ", W),
+        colors.white,
+        bg or colors.black
+    )
+end
+
+--------------------------------------------------
+-- MONITOR LAYOUT
+--------------------------------------------------
+
+local UI = {}
+
+local function calculateLayout()
+
+    UI.eta = H
+    UI.message = H - 1
+    UI.status = H - 2
+    UI.print = H - 3
+
+    UI.quantity = H - 4
+    UI.quantityTitle = H - 5
+
+    UI.scroll = H - 7
+
+    UI.bookStart = 7
+
+    UI.visibleBooks = math.min(
+        CONFIG.VISIBLE_BOOKS,
+        UI.scroll - UI.bookStart
     )
 
-    writeAt(x, y, message, color)
-end
-
-local function setStatus(message, color)
-
-    status = message
-    statusColor = color or colors.white
+    if UI.visibleBooks < 1 then
+        error("Monitor resolution too small. Increase MONITOR_SCALE.")
+    end
 
 end
 
---================================================
--- FLUID FUNCTIONS
---================================================
+calculateLayout()
 
-local function extractFluid(data)
+--------------------------------------------------
+-- DRAW MONITOR
+--------------------------------------------------
 
-    if type(data) ~= "table" then
-        return 0, nil
+local function drawMonitor()
+
+    W, H = monitor.getSize()
+
+    calculateLayout()
+
+    clearScreen()
+
+    --------------------------------------------------
+    -- HEADER
+    --------------------------------------------------
+
+    clearLine(1, colors.blue)
+
+    centerText(
+        1,
+        "BOOK PRINTING STATION",
+        colors.white,
+        colors.blue
+    )
+
+    --------------------------------------------------
+    -- FLUID MONITORING
+    --------------------------------------------------
+
+    local mainFluid = getMainFluid()
+    local printerFluid = getPrinterFluid()
+    local percentage = getMainPercentage()
+
+    local mainColor = colors.lime
+    local printerColor = colors.lime
+
+    if mainFluid < CONFIG.MIN_MAIN_FLUID_MB then
+        mainColor = colors.red
     end
 
-    -- Single fluid entry
-    if type(data.amount) == "number" then
-
-        return data.amount,
-            data.name or
-            (data.fluid and data.fluid.name)
-
+    if printerFluid < CONFIG.MIN_PRINTER_FLUID_MB then
+        printerColor = colors.red
     end
 
-    -- Nested fluid entry
-    if type(data.fluid) == "table" then
+    writeAt(2, 3, "MAIN TANK:", colors.white)
 
-        return tonumber(data.fluid.amount)
-            or tonumber(data.amount)
-            or 0,
-            data.fluid.name or data.name
+    writeAt(
+        14, 3,
+        percentage .. "% (" ..
+        mainFluid .. "/" ..
+        CONFIG.FLUID_TANK_CAPACITY_MB .. " mB)",
+        mainColor
+    )
 
-    end
+    writeAt(2, 4, "PRINTER:", colors.white)
 
-    -- Multiple tanks or fluid entries
-    local total = 0
-    local fluidName = nil
+    writeAt(
+        14, 4,
+        printerFluid .. " mB",
+        printerColor
+    )
 
-    for _, entry in pairs(data) do
+    --------------------------------------------------
+    -- BOOK CATALOGUE
+    --------------------------------------------------
 
-        if type(entry) == "table" then
+    centerText(6, "AVAILABLE BOOKS", colors.yellow)
 
-            local amount = tonumber(entry.amount) or 0
+    refreshCatalogue()
 
-            local name = entry.name
+    for i = 1, UI.visibleBooks do
 
-            if type(entry.fluid) == "table" then
+        local index = i + scrollOffset
+        local book = catalogue[index]
 
-                amount = tonumber(entry.fluid.amount)
-                    or amount
+        local y = UI.bookStart + i - 1
 
-                name = entry.fluid.name or name
+        clearLine(y)
+
+        if book then
+
+            local prefix = "  "
+            local fg = colors.white
+            local bg = colors.black
+
+            if selectedBook == book.fingerprint then
+
+                prefix = "> "
+                fg = colors.black
+                bg = colors.yellow
 
             end
 
-            total = total + amount
+            local label = book.name
 
-            if amount > 0 then
-                fluidName = fluidName or name
+            local maxLength = W - 14
+
+            if #label > maxLength then
+                label = label:sub(1, maxLength - 3) .. "..."
             end
+
+            clearLine(y, bg)
+
+            writeAt(
+                2, y,
+                prefix .. label,
+                fg, bg
+            )
+
+            writeAt(
+                W - 8, y,
+                "x" .. book.count,
+                fg, bg
+            )
 
         end
 
     end
 
-    return total, fluidName
+    --------------------------------------------------
+    -- SCROLL CONTROLS
+    --------------------------------------------------
 
-end
-
-local function readTank()
-
-    local ok, result = pcall(
-        tank.getFluids
+    centerText(
+        UI.scroll,
+        "< PREVIOUS       NEXT >",
+        colors.cyan
     )
 
-    if not ok then
-        return nil, nil
-    end
+    --------------------------------------------------
+    -- QUANTITY SELECTOR
+    --------------------------------------------------
 
-    return extractFluid(result)
-
-end
-
-local function readPrinter()
-
-    local ok, result = pcall(
-        printerCall,
-        "tanks"
+    centerText(
+        UI.quantityTitle,
+        "QUANTITY",
+        colors.yellow
     )
 
-    if not ok then
-        return nil, nil
-    end
+    local buttonWidth = math.floor(W / CONFIG.MAX_BOOKS)
 
-    return extractFluid(result)
+    for i = 1, CONFIG.MAX_BOOKS do
 
-end
+        local x = (i - 1) * buttonWidth + 1
 
---================================================
--- AUTOMATIC PRINTER REFILL
---================================================
+        local fg = colors.white
+        local bg = colors.gray
 
-local function refillPrinter()
-
-    local sourceAmount, sourceFluid = readTank()
-
-    local printerAmount, printerFluid = readPrinter()
-
-    if sourceAmount == nil or printerAmount == nil then
-
-        return false, "FLUID READING ERROR"
-
-    end
-
-    -- Already enough fluid
-    if printerAmount >= CONFIG.minimumFluid then
-
-        return true, "FLUID OK"
-
-    end
-
-    -- Check source tank
-    if sourceAmount <= 0 then
-
-        return false, "SOURCE TANK EMPTY"
-
-    end
-
-    if not sourceFluid then
-
-        return false, "UNKNOWN SOURCE FLUID"
-
-    end
-
-    -- Avoid mixing fluid types
-    if printerFluid
-        and printerFluid ~= sourceFluid then
-
-        return false, "FLUID TYPE MISMATCH"
-
-    end
-
-    local needed =
-        CONFIG.minimumFluid - printerAmount
-
-    local transfer =
-        math.min(needed, sourceAmount)
-
-    setStatus("REFILLING PRINTER...", colors.yellow)
-
-    drawUI()
-
-    local ok, result = pcall(
-
-        printerCall,
-
-        "pullFluid",
-
-        CONFIG.tank,
-
-        transfer,
-
-        sourceFluid
-
-    )
-
-    if not ok then
-
-        return false,
-            "REFILL ERROR: " .. tostring(result)
-
-    end
-
-    -- Verify actual Printer fluid amount
-    local updatedAmount = readPrinter()
-
-    if updatedAmount
-        and updatedAmount >= CONFIG.minimumFluid then
-
-        return true, "REFILL COMPLETE"
-
-    end
-
-    return false, "INSUFFICIENT FLUID"
-
-end
-
---================================================
--- INVENTORY FUNCTIONS
---================================================
-
-local function getChestItems()
-
-    local result = {}
-
-    local inventory = chest.list()
-
-    for slot, item in pairs(inventory) do
-
-        local detail = chest.getItemDetails(slot)
-
-        result[#result + 1] = {
-
-            slot = slot,
-
-            id = item.name,
-
-            count = item.count,
-
-            name = detail
-                and detail.displayName
-                or item.name
-
-        }
-
-    end
-
-    table.sort(result, function(a, b)
-
-        return a.slot < b.slot
-
-    end)
-
-    return result
-
-end
-
-local function getDeployerItems()
-
-    local result = {}
-
-    local inventory = deployer.list()
-
-    for slot, item in pairs(inventory) do
-
-        local detail = deployer.getItemDetail(slot)
-
-        result[#result + 1] = {
-
-            slot = slot,
-
-            id = item.name,
-
-            count = item.count,
-
-            name = detail
-                and detail.displayName
-                or item.name
-
-        }
-
-    end
-
-    return result
-
-end
-
-local function refreshInventory()
-
-    books = getChestItems()
-
-    if selected then
-
-        local found = false
-
-        for _, item in ipairs(books) do
-
-            if item.slot == selected.slot
-                and item.id == selected.id then
-
-                selected = item
-                found = true
-
-                break
-
-            end
-
+        if selectedQuantity == i then
+            fg = colors.black
+            bg = colors.green
         end
 
-        if not found then
-            selected = nil
-        end
-
-    end
-
-end
-
---================================================
--- EMPTY DEPLOYER
---================================================
-
-local function emptyDeployer()
-
-    local inventory = deployer.list()
-
-    for slot, item in pairs(inventory) do
-
-        local moved = deployer.pushItems(
-
-            CONFIG.chest,
-
-            slot,
-
-            item.count
-
+        writeAt(
+            x,
+            UI.quantity,
+            string.rep(" ", buttonWidth),
+            fg,
+            bg
         )
 
-        if moved ~= item.count then
+        local label = "[" .. i .. "]"
 
-            return false,
-                "CANNOT RETURN ITEM FROM SLOT " .. slot
-
-        end
+        writeAt(
+            x + math.floor((buttonWidth - #label) / 2),
+            UI.quantity,
+            label,
+            fg,
+            bg
+        )
 
     end
 
-    -- Verify actual inventory
-    local remaining = deployer.list()
+    --------------------------------------------------
+    -- PRINT BUTTON
+    --------------------------------------------------
 
-    for _, item in pairs(remaining) do
+    local printText = "[ START PRINTING ]"
 
-        if item.count > 0 then
+    local printX = math.floor((W - #printText) / 2) + 1
 
-            return false, "DEPLOYER NOT EMPTY"
+    writeAt(
+        printX,
+        UI.print,
+        printText,
+        colors.black,
+        colors.lime
+    )
 
-        end
+    --------------------------------------------------
+    -- STATUS
+    --------------------------------------------------
+
+    local statusColor = colors.white
+
+    if status == "READY" then
+        statusColor = colors.lime
+    elseif status == "ERROR" then
+        statusColor = colors.red
+    elseif status == "PRINTING" then
+        statusColor = colors.yellow
+    end
+
+    centerText(
+        UI.status,
+        status,
+        statusColor
+    )
+
+    centerText(
+        UI.message,
+        message,
+        colors.white
+    )
+
+    --------------------------------------------------
+    -- ETA
+    --------------------------------------------------
+
+    if busy then
+
+        centerText(
+            UI.eta,
+            "ETA: " .. remainingTime .. "s",
+            colors.orange
+        )
+
+    else
+
+        centerText(
+            UI.eta,
+            " ",
+            colors.white
+        )
+
+    end
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+
+end
+
+--------------------------------------------------
+-- FLUID SAFETY
+--------------------------------------------------
+
+local function checkFluids()
+
+    local mainAmount = getMainFluid()
+    local printerAmount = getPrinterFluid()
+
+    if mainAmount < CONFIG.MIN_MAIN_FLUID_MB then
+
+        return false,
+            "Main tank below 10000 mB!"
+
+    end
+
+    if printerAmount < CONFIG.MIN_PRINTER_FLUID_MB then
+
+        return false,
+            "Printer below 500 mB!"
 
     end
 
@@ -424,451 +676,493 @@ local function emptyDeployer()
 
 end
 
---================================================
--- LOAD SELECTED BOOK
---================================================
+--------------------------------------------------
+-- ERROR HANDLING
+--------------------------------------------------
 
-local busy = false
+local function showError(text)
 
-local function loadSelected()
+    status = "ERROR"
+    message = text
+
+    busy = false
+    remainingTime = 0
+
+    drawMonitor()
+
+end
+
+--------------------------------------------------
+-- RETURN PREVIOUS TEMPLATE
+--------------------------------------------------
+
+local function returnPreviousTemplate()
+
+    local amount = countItems(inputBook)
+
+    if amount == 0 then
+        return true
+    end
+
+    local moved = moveItems(
+        inputBook,
+        availableBooks,
+        amount
+    )
+
+    if moved ~= amount then
+        return false
+    end
+
+    return true
+
+end
+
+--------------------------------------------------
+-- LOAD SELECTED TEMPLATE
+--------------------------------------------------
+
+local function loadSelectedTemplate(fingerprint)
+
+    -- Return the previously selected template.
+
+    if not returnPreviousTemplate() then
+
+        return false,
+            "Cannot return previous book"
+
+    end
+
+    -- Find the selected template again.
+    -- Its slot may have changed.
+
+    local slot = findBook(fingerprint)
+
+    if not slot then
+
+        return false,
+            "Selected book unavailable"
+
+    end
+
+    local moved = availableBooks.pushItems(
+        peripheralName("input_book"),
+        slot,
+        1
+    )
+
+    if moved ~= 1 then
+
+        return false,
+            "Cannot load selected book"
+
+    end
+
+    return true
+
+end
+
+--------------------------------------------------
+-- PRINTING PROCESS
+--------------------------------------------------
+
+local function printBooks(book, quantity)
+
+    busy = true
+
+    --------------------------------------------------
+    -- SAFETY CHECK
+    --------------------------------------------------
+
+    status = "CHECKING"
+    message = "Checking machine..."
+
+    drawMonitor()
+
+    local fluidsOK, fluidError = checkFluids()
+
+    if not fluidsOK then
+
+        showError(fluidError)
+        return
+
+    end
+
+    --------------------------------------------------
+    -- CHECK INVENTORIES
+    --------------------------------------------------
+
+    if countItems(rawBooks) < quantity then
+
+        showError("Not enough raw books")
+        return
+
+    end
+
+    if not inventoryEmpty(inputRawBooks) then
+
+        showError("Input raw books not empty")
+        return
+
+    end
+
+    if not inventoryEmpty(printedBooks) then
+
+        showError("Printed buffer not empty")
+        return
+
+    end
+
+    --------------------------------------------------
+    -- LOAD TEMPLATE
+    --------------------------------------------------
+
+    status = "LOADING"
+    message = "Loading selected book..."
+
+    drawMonitor()
+
+    local loaded, loadError = loadSelectedTemplate(
+        book.fingerprint
+    )
+
+    if not loaded then
+
+        showError(loadError)
+        return
+
+    end
+
+    --------------------------------------------------
+    -- LOAD RAW BOOKS
+    --------------------------------------------------
+
+    message = "Loading raw books..."
+
+    drawMonitor()
+
+    local moved = moveItems(
+        rawBooks,
+        inputRawBooks,
+        quantity
+    )
+
+    if moved ~= quantity then
+
+        showError("Cannot load all raw books")
+        return
+
+    end
+
+    --------------------------------------------------
+    -- RECORD INITIAL OUTPUT
+    --------------------------------------------------
+
+    local initialPrinted = countItems(printedBooks)
+
+    --------------------------------------------------
+    -- START MACHINE
+    --------------------------------------------------
+
+    machineOn()
+
+    status = "PRINTING"
+    message = "Printing in progress..."
+
+    local expectedTime =
+        quantity * CONFIG.SECONDS_PER_BOOK
+
+    remainingTime = expectedTime
+
+    local startTime = os.clock()
+
+    drawMonitor()
+
+    --------------------------------------------------
+    -- WAIT FOR PRINTED BOOKS
+    --------------------------------------------------
+
+    while countItems(printedBooks) <
+        initialPrinted + quantity do
+
+        local elapsed = os.clock() - startTime
+
+        remainingTime = math.max(
+            0,
+            math.ceil(expectedTime - elapsed)
+        )
+
+        -- Continuously monitor fluids.
+
+        local fluidsOK = checkFluids()
+
+        if not fluidsOK then
+
+            showError("Fluid level too low!")
+            return
+
+        end
+
+        drawMonitor()
+
+        sleep(CONFIG.REFRESH_RATE)
+
+    end
+
+    --------------------------------------------------
+    -- TRANSFER PRINTED BOOKS
+    --------------------------------------------------
+
+    status = "TRANSFERRING"
+    message = "Transferring printed books..."
+
+    drawMonitor()
+
+    local transferred = moveItems(
+        printedBooks,
+        outputBooks,
+        quantity
+    )
+
+    if transferred ~= quantity then
+
+        showError("Output transfer incomplete")
+        return
+
+    end
+
+    --------------------------------------------------
+    -- REDSTONE RESET
+    --------------------------------------------------
+
+    status = "RESETTING"
+    message = "Resetting printer..."
+
+    machineOff()
+
+    drawMonitor()
+
+    sleep(CONFIG.RESET_DURATION)
+
+    machineOn()
+
+    --------------------------------------------------
+    -- PRODUCTION COMPLETED
+    --------------------------------------------------
+
+    status = "READY"
+    message = "Production completed!"
+
+    remainingTime = 0
+    busy = false
+
+    refreshCatalogue()
+    drawMonitor()
+
+end
+
+--------------------------------------------------
+-- TOUCHSCREEN INPUT
+--------------------------------------------------
+
+local function handleTouch(x, y)
 
     if busy then
         return
     end
 
-    if not selected then
+    refreshCatalogue()
 
-        setStatus("SELECT AN ITEM FIRST", colors.red)
-        return
+    --------------------------------------------------
+    -- BOOK SELECTION
+    --------------------------------------------------
 
-    end
+    local firstBookY = UI.bookStart
+    local lastBookY = UI.bookStart + UI.visibleBooks - 1
 
-    busy = true
+    if y >= firstBookY and y <= lastBookY then
 
-    local function finish(message, color)
+        local index = y - UI.bookStart + 1 + scrollOffset
 
-        setStatus(message, color)
-        busy = false
-        refreshInventory()
-        drawUI()
+        local book = catalogue[index]
 
-    end
+        if book then
 
-    -- FIRST FLUID CHECK
-    local success, message = refillPrinter()
+            selectedBook = book.fingerprint
 
-    if not success then
+            status = "READY"
+            message = "Book selected"
 
-        finish(message, colors.red)
-        return
-
-    end
-
-    -- VERIFY SELECTED CHEST ITEM
-    local current = chest.list()[selected.slot]
-
-    if not current or current.name ~= selected.id then
-
-        finish("ITEM NO LONGER AVAILABLE", colors.red)
-        return
-
-    end
-
-    -- RETURN PREVIOUS DEPLOYER ITEM
-    setStatus("RETURNING OLD ITEM...", colors.yellow)
-    drawUI()
-
-    local emptied, reason = emptyDeployer()
-
-    if not emptied then
-
-        finish(reason, colors.red)
-        return
-
-    end
-
-    -- REFILL / CHECK AGAIN
-    success, message = refillPrinter()
-
-    if not success then
-
-        finish(message, colors.red)
-        return
-
-    end
-
-    -- VERIFY ITEM STILL EXISTS
-    current = chest.list()[selected.slot]
-
-    if not current or current.name ~= selected.id then
-
-        finish("SELECTED ITEM MISSING", colors.red)
-        return
-
-    end
-
-    -- INSERT ONE ITEM
-    setStatus("INSERTING ITEM...", colors.yellow)
-    drawUI()
-
-    local moved = chest.pushItems(
-
-        CONFIG.deployer,
-
-        selected.slot,
-
-        1
-
-    )
-
-    if moved ~= 1 then
-
-        finish("ITEM INSERTION FAILED", colors.red)
-        return
-
-    end
-
-    -- VERIFY USING REAL DEPLOYER INVENTORY
-    local actual = getDeployerItems()
-
-    local found = false
-
-    for _, item in ipairs(actual) do
-
-        if item.id == selected.id then
-
-            found = true
-            break
+            drawMonitor()
 
         end
 
+        return
+
     end
 
-    if found then
+    --------------------------------------------------
+    -- SCROLLING
+    --------------------------------------------------
 
-        finish("ITEM INSTALLED SUCCESSFULLY", colors.lime)
+    if y == UI.scroll then
 
-    else
+        if x < W / 2 then
 
-        finish("ITEM VERIFICATION FAILED", colors.red)
+            scrollOffset = math.max(
+                0,
+                scrollOffset - 1
+            )
+
+        else
+
+            scrollOffset = math.min(
+                math.max(0, #catalogue - UI.visibleBooks),
+                scrollOffset + 1
+            )
+
+        end
+
+        drawMonitor()
+
+        return
+
+    end
+
+    --------------------------------------------------
+    -- QUANTITY SELECTION
+    --------------------------------------------------
+
+    if y == UI.quantity then
+
+        local buttonWidth = math.floor(
+            W / CONFIG.MAX_BOOKS
+        )
+
+        local quantity = math.floor(
+            (x - 1) / buttonWidth
+        ) + 1
+
+        if quantity >= 1 and
+            quantity <= CONFIG.MAX_BOOKS then
+
+            selectedQuantity = quantity
+
+            drawMonitor()
+
+        end
+
+        return
+
+    end
+
+    --------------------------------------------------
+    -- START PRINTING
+    --------------------------------------------------
+
+    if y == UI.print then
+
+        if not selectedBook then
+
+            showError("Select a book first")
+            return
+
+        end
+
+        local selected = nil
+
+        for _, book in ipairs(catalogue) do
+
+            if book.fingerprint == selectedBook then
+
+                selected = book
+                break
+
+            end
+
+        end
+
+        if not selected then
+
+            showError("Selected book unavailable")
+            return
+
+        end
+
+        printBooks(
+            selected,
+            selectedQuantity
+        )
+
+        return
 
     end
 
 end
 
---================================================
--- USER INTERFACE
---================================================
+--------------------------------------------------
+-- STARTUP DISPLAY
+--------------------------------------------------
 
-function drawUI()
+refreshCatalogue()
 
-    monitor.setBackgroundColor(colors.black)
-    monitor.clear()
+status = "READY"
+message = "Select a book"
 
-    center(1, "CREATE PRINTER CONTROL", colors.cyan)
+drawMonitor()
 
-    -- SOURCE TANK
-    local sourceAmount = readTank()
+--------------------------------------------------
+-- MAIN EVENT LOOP
+--------------------------------------------------
 
-    writeAt(2, 2, "SOURCE TANK:", colors.lightBlue)
+local refreshTimer = os.startTimer(
+    CONFIG.REFRESH_RATE
+)
 
-    writeAt(
-        15,
-        2,
-        sourceAmount and
-            (sourceAmount .. " mB")
-            or "ERROR",
-        sourceAmount and
-            colors.lime or colors.red
-    )
+while true do
 
-    -- PRINTER FLUID
-    local printerAmount = readPrinter()
+    local event, p1, p2, p3 = os.pullEvent()
 
-    writeAt(2, 3, "PRINTER FLUID:", colors.lightBlue)
+    --------------------------------------------------
+    -- MONITOR TOUCH
+    --------------------------------------------------
 
-    writeAt(
-        17,
-        3,
-        printerAmount and
-            (printerAmount .. " mB")
-            or "ERROR",
-        printerAmount
-            and printerAmount >= CONFIG.minimumFluid
-            and colors.lime
-            or colors.red
-    )
+    if event == "monitor_touch" then
 
-    -- DEPLOYER CONTENTS
-    writeAt(2, 4, "DEPLOYER:", colors.yellow)
+        local side = p1
+        local x = p2
+        local y = p3
 
-    local contents = getDeployerItems()
+        if side == peripheralName("monitor") then
 
-    if #contents == 0 then
+            handleTouch(x, y)
 
-        writeAt(13, 4, "EMPTY", colors.gray)
+        end
 
-    else
+    --------------------------------------------------
+    -- MONITOR RESIZE
+    --------------------------------------------------
 
-        local item = contents[1]
+    elseif event == "monitor_resize" then
 
-        writeAt(
-            13,
-            4,
-            item.name .. " x" .. item.count,
-            colors.lime
+        W, H = monitor.getSize()
+
+        drawMonitor()
+
+    --------------------------------------------------
+    -- AUTOMATIC REFRESH
+    --------------------------------------------------
+
+    elseif event == "timer" and p1 == refreshTimer then
+
+        if not busy then
+            drawMonitor()
+        end
+
+        refreshTimer = os.startTimer(
+            CONFIG.REFRESH_RATE
         )
 
     end
 
-    writeAt(
-        1,
-        5,
-        string.rep("-", W),
-        colors.gray
-    )
-
-    center(6, "SELECT PRINTABLE ITEM", colors.cyan)
-
-    -- ITEM LIST
-    local rows = math.max(1, H - 9)
-
-    local start = (page - 1) * rows + 1
-
-    for i = 0, rows - 1 do
-
-        local item = books[start + i]
-
-        if item then
-
-            local prefix = "  "
-
-            if selected
-                and selected.slot == item.slot then
-
-                prefix = "> "
-
-            end
-
-            local label =
-                prefix ..
-                item.name ..
-                " x" ..
-                item.count
-
-            if selected
-                and selected.slot == item.slot then
-
-                writeAt(
-                    2,
-                    7 + i,
-                    label,
-                    colors.black,
-                    colors.lime
-                )
-
-            else
-
-                writeAt(
-                    2,
-                    7 + i,
-                    label,
-                    colors.white
-                )
-
-            end
-
-        end
-
-    end
-
-    -- PAGE
-    local totalPages = math.max(
-        1,
-        math.ceil(#books / rows)
-    )
-
-    writeAt(
-        2,
-        H - 2,
-        "PAGE " .. page .. "/" .. totalPages,
-        colors.lightBlue
-    )
-
-    -- STATUS
-    writeAt(
-        2,
-        H - 1,
-        status,
-        statusColor
-    )
-
-    -- BUTTONS
-    local buttonWidth = math.floor(W / 4)
-
-    writeAt(
-        1,
-        H,
-        "[PREV]",
-        colors.white,
-        colors.gray
-    )
-
-    writeAt(
-        buttonWidth + 1,
-        H,
-        "[LOAD]",
-        colors.white,
-        colors.blue
-    )
-
-    writeAt(
-        buttonWidth * 2 + 1,
-        H,
-        "[NEXT]",
-        colors.white,
-        colors.gray
-    )
-
-    writeAt(
-        buttonWidth * 3 + 1,
-        H,
-        "[REFRESH]",
-        colors.white,
-        colors.green
-    )
-
-    monitor.setBackgroundColor(colors.black)
-
 end
-
---================================================
--- TOUCHSCREEN
---================================================
-
-local function handleTouch(x, y)
-
-    local rows = math.max(1, H - 9)
-
-    local buttonWidth = math.floor(W / 4)
-
-    if y == H then
-
-        if x <= buttonWidth then
-
-            page = math.max(1, page - 1)
-
-        elseif x <= buttonWidth * 2 then
-
-            loadSelected()
-
-            return
-
-        elseif x <= buttonWidth * 3 then
-
-            local maxPages = math.max(
-                1,
-                math.ceil(#books / rows)
-            )
-
-            page = math.min(maxPages, page + 1)
-
-        else
-
-            refreshInventory()
-
-            setStatus("INVENTORY REFRESHED", colors.lime)
-
-        end
-
-        drawUI()
-        return
-
-    end
-
-    -- ITEM SELECTION
-    if y >= 7 and y <= H - 3 then
-
-        local index =
-            (page - 1) * rows + (y - 7) + 1
-
-        if books[index] then
-
-            selected = books[index]
-
-            setStatus(
-                "SELECTED: " .. selected.name,
-                colors.cyan
-            )
-
-            drawUI()
-
-        end
-
-    end
-
-end
-
---================================================
--- MAIN LOOP
---================================================
-
-refreshInventory()
-drawUI()
-
-local lastRefresh = os.clock()
-local lastRefill = os.clock()
-
-while running do
-
-    local event, p1, p2, p3 = os.pullEvent()
-
-    if event == "monitor_touch"
-        and p1 == CONFIG.monitor then
-
-        handleTouch(p2, p3)
-
-    elseif event == "terminate" then
-
-        running = false
-
-    end
-
-    -- PERIODIC REFRESH
-    if os.clock() - lastRefresh >= CONFIG.refreshRate then
-
-        refreshInventory()
-
-        lastRefresh = os.clock()
-
-        drawUI()
-
-    end
-
-    -- AUTOMATIC FLUID REFILL
-    if not busy and os.clock() - lastRefill >= 2 then
-
-        lastRefill = os.clock()
-
-        local ok, message = refillPrinter()
-
-        if not ok then
-
-            setStatus(message, colors.red)
-
-        elseif message == "REFILL COMPLETE" then
-
-            setStatus(message, colors.lime)
-
-        end
-
-        drawUI()
-
-    end
-
-end
-
-monitor.setBackgroundColor(colors.black)
-monitor.clear()
-
-print("Printer controller stopped.")

@@ -83,16 +83,12 @@ local printer = getPeripheral("printer")
 local monitor = getPeripheral("monitor")
 local relay = getPeripheral("redstone_relay")
 
---------------------------------------------------
--- PERIPHERAL NAMES
---------------------------------------------------
-
-local function peripheralName(configName)
-    return CONFIG.PERIPHERALS[configName]
+local function peripheralName(name)
+    return CONFIG.PERIPHERALS[name]
 end
 
 --------------------------------------------------
--- INITIALIZATION
+-- STATE
 --------------------------------------------------
 
 monitor.setTextScale(CONFIG.MONITOR_SCALE)
@@ -112,7 +108,7 @@ local remainingTime = 0
 local catalogue = {}
 
 --------------------------------------------------
--- REDSTONE CONTROL
+-- REDSTONE
 --------------------------------------------------
 
 local function machineOn()
@@ -123,26 +119,26 @@ local function machineOff()
     relay.setOutput(CONFIG.REDSTONE_SIDE, false)
 end
 
--- Always turn ON at startup.
 machineOn()
 
 --------------------------------------------------
--- INVENTORY FUNCTIONS
+-- INVENTORY
 --------------------------------------------------
 
-local function countItems(inventory)
+local function countItems(inv)
 
     local total = 0
 
-    for _, item in pairs(inventory.list()) do
+    for _, item in pairs(inv.list()) do
         total = total + item.count
     end
 
     return total
+
 end
 
-local function inventoryEmpty(inventory)
-    return countItems(inventory) == 0
+local function inventoryEmpty(inv)
+    return countItems(inv) == 0
 end
 
 local function moveItems(source, destination, amount)
@@ -150,17 +146,20 @@ local function moveItems(source, destination, amount)
     local remaining = amount
     local moved = 0
 
-    local destinationName = peripheralName(
-        destination == rawBooks and "raw_books" or
-        destination == availableBooks and "available_books" or
-        destination == inputRawBooks and "input_raw_books" or
-        destination == printedBooks and "printed_books" or
-        destination == outputBooks and "output_books" or
-        destination == inputBook and "input_book" or
-        ""
-    )
+    local destinationName = nil
 
-    if destinationName == "" then
+    local destinations = {
+        [rawBooks] = "raw_books",
+        [availableBooks] = "available_books",
+        [inputRawBooks] = "input_raw_books",
+        [printedBooks] = "printed_books",
+        [outputBooks] = "output_books",
+        [inputBook] = "input_book"
+    }
+
+    destinationName = destinations[destination]
+
+    if not destinationName then
         error("Unknown destination inventory")
     end
 
@@ -170,38 +169,32 @@ local function moveItems(source, destination, amount)
             break
         end
 
-        local amountToMove = math.min(
-            item.count,
-            remaining
-        )
+        local amountToMove = math.min(item.count, remaining)
 
         local transferred = source.pushItems(
-            destinationName,
+            peripheralName(destinationName),
             slot,
             amountToMove
         )
 
         moved = moved + transferred
         remaining = remaining - transferred
+
     end
 
     return moved
+
 end
 
 --------------------------------------------------
--- FLUID FUNCTIONS
+-- FLUID
 --------------------------------------------------
 
-local function getFluidAmount(peripheralObject)
+local function getFluidAmount(p)
 
     local total = 0
-    local tanks = peripheralObject.tanks()
 
-    if not tanks then
-        return 0
-    end
-
-    for _, tank in pairs(tanks) do
+    for _, tank in pairs(p.tanks()) do
 
         if tank and tank.amount then
             total = total + tank.amount
@@ -210,6 +203,7 @@ local function getFluidAmount(peripheralObject)
     end
 
     return total
+
 end
 
 local function getMainFluid()
@@ -222,15 +216,11 @@ end
 
 local function getMainPercentage()
 
-    local capacity = CONFIG.FLUID_TANK_CAPACITY_MB
-
-    if capacity <= 0 then
-        return 0
-    end
-
     return math.floor(
-        getMainFluid() / capacity * 100
+        getMainFluid() /
+        CONFIG.FLUID_TANK_CAPACITY_MB * 100
     )
+
 end
 
 --------------------------------------------------
@@ -250,10 +240,11 @@ local function getFingerprint(detail)
     end
 
     return detail.name .. "|" .. nbt
+
 end
 
 --------------------------------------------------
--- BOOK CATALOGUE
+-- CATALOGUE
 --------------------------------------------------
 
 local function refreshCatalogue()
@@ -274,7 +265,6 @@ local function refreshCatalogue()
                 indexed[fingerprint] = {
                     fingerprint = fingerprint,
                     name = detail.displayName or detail.name,
-                    itemName = detail.name,
                     count = 0
                 }
 
@@ -297,11 +287,8 @@ local function refreshCatalogue()
     end)
 
     catalogue = newCatalogue
-end
 
---------------------------------------------------
--- FIND SELECTED BOOK IN INVENTORY
---------------------------------------------------
+end
 
 local function findBook(fingerprint)
 
@@ -310,28 +297,22 @@ local function findBook(fingerprint)
         local detail = availableBooks.getItemDetail(slot)
 
         if detail and getFingerprint(detail) == fingerprint then
-            return slot, item.count
+            return slot
         end
 
     end
 
-    return nil, 0
+    return nil
+
 end
 
 --------------------------------------------------
--- MONITOR DRAWING
+-- LOW LEVEL DRAWING
 --------------------------------------------------
-
-local function clearScreen()
-
-    monitor.setBackgroundColor(colors.black)
-    monitor.setTextColor(colors.white)
-    monitor.clear()
-end
 
 local function writeAt(x, y, text, fg, bg)
 
-    if y < 1 or y > H then
+    if y < 1 or y > H or x > W then
         return
     end
 
@@ -342,18 +323,14 @@ local function writeAt(x, y, text, fg, bg)
         x = 1
     end
 
-    if x > W then
-        return
-    end
-
     text = text:sub(1, W - x + 1)
 
     monitor.setCursorPos(x, y)
-
     monitor.setTextColor(fg or colors.white)
     monitor.setBackgroundColor(bg or colors.black)
 
     monitor.write(text)
+
 end
 
 local function centerText(y, text, fg, bg)
@@ -361,6 +338,7 @@ local function centerText(y, text, fg, bg)
     local x = math.floor((W - #text) / 2) + 1
 
     writeAt(x, y, text, fg, bg)
+
 end
 
 local function clearLine(y, bg)
@@ -372,27 +350,28 @@ local function clearLine(y, bg)
         colors.white,
         bg or colors.black
     )
+
 end
 
 --------------------------------------------------
--- MONITOR LAYOUT
+-- LAYOUT
 --------------------------------------------------
 
 local UI = {}
 
 local function calculateLayout()
 
-    UI.eta = H
-    UI.message = H - 1
-    UI.status = H - 2
-    UI.print = H - 3
-
-    UI.quantity = H - 4
-    UI.quantityTitle = H - 5
-
-    UI.scroll = H - 7
-
     UI.bookStart = 7
+
+    -- Reserve more vertical space for buttons.
+    UI.quantityTitle = H - 7
+    UI.quantity = H - 6
+    UI.print = H - 4
+    UI.status = H - 3
+    UI.message = H - 2
+    UI.eta = H
+
+    UI.scroll = H - 8
 
     UI.visibleBooks = math.min(
         CONFIG.VISIBLE_BOOKS,
@@ -400,7 +379,7 @@ local function calculateLayout()
     )
 
     if UI.visibleBooks < 1 then
-        error("Monitor resolution too small. Increase MONITOR_SCALE.")
+        error("Monitor too small for interface")
     end
 
 end
@@ -408,72 +387,49 @@ end
 calculateLayout()
 
 --------------------------------------------------
--- DRAW MONITOR
+-- DRAW FLUIDS ONLY
 --------------------------------------------------
 
-local function drawMonitor()
+local function drawFluids()
 
-    W, H = monitor.getSize()
-
-    calculateLayout()
-
-    clearScreen()
-
-    --------------------------------------------------
-    -- HEADER
-    --------------------------------------------------
-
-    clearLine(1, colors.blue)
-
-    centerText(
-        1,
-        "BOOK PRINTING STATION",
-        colors.white,
-        colors.blue
-    )
-
-    --------------------------------------------------
-    -- FLUID MONITORING
-    --------------------------------------------------
-
-    local mainFluid = getMainFluid()
-    local printerFluid = getPrinterFluid()
-    local percentage = getMainPercentage()
+    local main = getMainFluid()
+    local printerAmount = getPrinterFluid()
 
     local mainColor = colors.lime
     local printerColor = colors.lime
 
-    if mainFluid < CONFIG.MIN_MAIN_FLUID_MB then
+    if main < CONFIG.MIN_MAIN_FLUID_MB then
         mainColor = colors.red
     end
 
-    if printerFluid < CONFIG.MIN_PRINTER_FLUID_MB then
+    if printerAmount < CONFIG.MIN_PRINTER_FLUID_MB then
         printerColor = colors.red
     end
 
-    writeAt(2, 3, "MAIN TANK:", colors.white)
+    -- Only update the changing values.
+    -- No screen clear, no catalogue redraw.
 
     writeAt(
         14, 3,
-        percentage .. "% (" ..
-        mainFluid .. "/" ..
-        CONFIG.FLUID_TANK_CAPACITY_MB .. " mB)",
+        getMainPercentage() .. "% (" ..
+        main .. "/" ..
+        CONFIG.FLUID_TANK_CAPACITY_MB .. " mB)   ",
         mainColor
     )
 
-    writeAt(2, 4, "PRINTER:", colors.white)
-
     writeAt(
         14, 4,
-        printerFluid .. " mB",
+        printerAmount .. " mB     ",
         printerColor
     )
 
-    --------------------------------------------------
-    -- BOOK CATALOGUE
-    --------------------------------------------------
+end
 
-    centerText(6, "AVAILABLE BOOKS", colors.yellow)
+--------------------------------------------------
+-- DRAW BOOK LIST
+--------------------------------------------------
+
+local function drawBooks()
 
     refreshCatalogue()
 
@@ -481,7 +437,6 @@ local function drawMonitor()
 
         local index = i + scrollOffset
         local book = catalogue[index]
-
         local y = UI.bookStart + i - 1
 
         clearLine(y)
@@ -493,11 +448,9 @@ local function drawMonitor()
             local bg = colors.black
 
             if selectedBook == book.fingerprint then
-
                 prefix = "> "
                 fg = colors.black
                 bg = colors.yellow
-
             end
 
             local label = book.name
@@ -510,45 +463,31 @@ local function drawMonitor()
 
             clearLine(y, bg)
 
-            writeAt(
-                2, y,
-                prefix .. label,
-                fg, bg
-            )
+            writeAt(2, y, prefix .. label, fg, bg)
 
             writeAt(
-                W - 8, y,
+                W - 8,
+                y,
                 "x" .. book.count,
-                fg, bg
+                fg,
+                bg
             )
 
         end
 
     end
 
-    --------------------------------------------------
-    -- SCROLL CONTROLS
-    --------------------------------------------------
+end
 
-    centerText(
-        UI.scroll,
-        "< PREVIOUS       NEXT >",
-        colors.cyan
-    )
+--------------------------------------------------
+-- DRAW QUANTITY BUTTONS
+--------------------------------------------------
 
-    --------------------------------------------------
-    -- QUANTITY SELECTOR
-    --------------------------------------------------
+local function drawQuantity()
 
-    centerText(
-        UI.quantityTitle,
-        "QUANTITY",
-        colors.yellow
-    )
+    local buttonWidth = math.floor(W / 5)
 
-    local buttonWidth = math.floor(W / CONFIG.MAX_BOOKS)
-
-    for i = 1, CONFIG.MAX_BOOKS do
+    for i = 1, 5 do
 
         local x = (i - 1) * buttonWidth + 1
 
@@ -560,15 +499,21 @@ local function drawMonitor()
             bg = colors.green
         end
 
-        writeAt(
-            x,
-            UI.quantity,
-            string.rep(" ", buttonWidth),
-            fg,
-            bg
-        )
+        -- Entire button area is colored.
 
-        local label = "[" .. i .. "]"
+        for row = UI.quantityTitle, UI.quantity do
+
+            writeAt(
+                x,
+                row,
+                string.rep(" ", buttonWidth),
+                fg,
+                bg
+            )
+
+        end
+
+        local label = "[ " .. i .. " ]"
 
         writeAt(
             x + math.floor((buttonWidth - #label) / 2),
@@ -580,25 +525,54 @@ local function drawMonitor()
 
     end
 
-    --------------------------------------------------
-    -- PRINT BUTTON
-    --------------------------------------------------
+end
 
-    local printText = "[ START PRINTING ]"
+--------------------------------------------------
+-- DRAW START BUTTON
+--------------------------------------------------
 
-    local printX = math.floor((W - #printText) / 2) + 1
+local function drawStartButton()
 
-    writeAt(
-        printX,
+    local label = " START PRINTING "
+
+    local width = math.min(W, #label + 8)
+    local x = math.floor((W - width) / 2) + 1
+
+    for row = UI.print, UI.print + 1 do
+
+        writeAt(
+            x,
+            row,
+            string.rep(" ", width),
+            colors.black,
+            colors.lime
+        )
+
+    end
+
+    centerText(
         UI.print,
-        printText,
+        label,
         colors.black,
         colors.lime
     )
 
-    --------------------------------------------------
-    -- STATUS
-    --------------------------------------------------
+    -- Second row gives the button a larger touch area.
+
+    centerText(
+        UI.print + 1,
+        string.rep(" ", width),
+        colors.black,
+        colors.lime
+    )
+
+end
+
+--------------------------------------------------
+-- DRAW STATUS ONLY
+--------------------------------------------------
+
+local function drawStatus()
 
     local statusColor = colors.white
 
@@ -610,39 +584,65 @@ local function drawMonitor()
         statusColor = colors.yellow
     end
 
-    centerText(
-        UI.status,
-        status,
-        statusColor
-    )
+    centerText(UI.status, status, statusColor)
 
-    centerText(
-        UI.message,
-        message,
-        colors.white
-    )
+    centerText(UI.message, message, colors.white)
 
-    --------------------------------------------------
-    -- ETA
-    --------------------------------------------------
+    local etaText = ""
 
     if busy then
-
-        centerText(
-            UI.eta,
-            "ETA: " .. remainingTime .. "s",
-            colors.orange
-        )
-
-    else
-
-        centerText(
-            UI.eta,
-            " ",
-            colors.white
-        )
-
+        etaText = "ETA: " .. remainingTime .. "s"
     end
+
+    centerText(UI.eta, etaText, colors.orange)
+
+end
+
+--------------------------------------------------
+-- DRAW COMPLETE SCREEN
+--------------------------------------------------
+
+local function drawMonitor()
+
+    W, H = monitor.getSize()
+    calculateLayout()
+
+    monitor.setBackgroundColor(colors.black)
+    monitor.setTextColor(colors.white)
+    monitor.clear()
+
+    clearLine(1, colors.blue)
+
+    centerText(
+        1,
+        "BOOK PRINTING STATION",
+        colors.white,
+        colors.blue
+    )
+
+    writeAt(2, 3, "MAIN TANK:", colors.white)
+    writeAt(2, 4, "PRINTER:", colors.white)
+
+    centerText(6, "AVAILABLE BOOKS", colors.yellow)
+
+    drawFluids()
+    drawBooks()
+
+    centerText(
+        UI.scroll,
+        "< PREVIOUS       NEXT >",
+        colors.cyan
+    )
+
+    centerText(
+        UI.quantityTitle,
+        "QUANTITY",
+        colors.yellow
+    )
+
+    drawQuantity()
+    drawStartButton()
+    drawStatus()
 
     monitor.setBackgroundColor(colors.black)
     monitor.setTextColor(colors.white)
@@ -655,21 +655,12 @@ end
 
 local function checkFluids()
 
-    local mainAmount = getMainFluid()
-    local printerAmount = getPrinterFluid()
-
-    if mainAmount < CONFIG.MIN_MAIN_FLUID_MB then
-
-        return false,
-            "Main tank below 10000 mB!"
-
+    if getMainFluid() < CONFIG.MIN_MAIN_FLUID_MB then
+        return false, "Main tank below 10000 mB!"
     end
 
-    if printerAmount < CONFIG.MIN_PRINTER_FLUID_MB then
-
-        return false,
-            "Printer below 500 mB!"
-
+    if getPrinterFluid() < CONFIG.MIN_PRINTER_FLUID_MB then
+        return false, "Printer below 500 mB!"
     end
 
     return true
@@ -677,7 +668,7 @@ local function checkFluids()
 end
 
 --------------------------------------------------
--- ERROR HANDLING
+-- ERROR DISPLAY
 --------------------------------------------------
 
 local function showError(text)
@@ -688,12 +679,12 @@ local function showError(text)
     busy = false
     remainingTime = 0
 
-    drawMonitor()
+    drawStatus()
 
 end
 
 --------------------------------------------------
--- RETURN PREVIOUS TEMPLATE
+-- MOVE PREVIOUS TEMPLATE BACK
 --------------------------------------------------
 
 local function returnPreviousTemplate()
@@ -710,39 +701,24 @@ local function returnPreviousTemplate()
         amount
     )
 
-    if moved ~= amount then
-        return false
-    end
-
-    return true
+    return moved == amount
 
 end
 
 --------------------------------------------------
--- LOAD SELECTED TEMPLATE
+-- LOAD TEMPLATE
 --------------------------------------------------
 
 local function loadSelectedTemplate(fingerprint)
 
-    -- Return the previously selected template.
-
     if not returnPreviousTemplate() then
-
-        return false,
-            "Cannot return previous book"
-
+        return false, "Cannot return previous book"
     end
-
-    -- Find the selected template again.
-    -- Its slot may have changed.
 
     local slot = findBook(fingerprint)
 
     if not slot then
-
-        return false,
-            "Selected book unavailable"
-
+        return false, "Selected book unavailable"
     end
 
     local moved = availableBooks.pushItems(
@@ -752,10 +728,7 @@ local function loadSelectedTemplate(fingerprint)
     )
 
     if moved ~= 1 then
-
-        return false,
-            "Cannot load selected book"
-
+        return false, "Cannot load selected book"
     end
 
     return true
@@ -763,54 +736,46 @@ local function loadSelectedTemplate(fingerprint)
 end
 
 --------------------------------------------------
--- PRINTING PROCESS
+-- PRODUCTION
 --------------------------------------------------
 
 local function printBooks(book, quantity)
 
     busy = true
 
-    --------------------------------------------------
-    -- SAFETY CHECK
-    --------------------------------------------------
-
     status = "CHECKING"
     message = "Checking machine..."
 
-    drawMonitor()
+    drawStatus()
+
+    --------------------------------------------------
+    -- FLUID CHECK
+    --------------------------------------------------
 
     local fluidsOK, fluidError = checkFluids()
 
     if not fluidsOK then
-
         showError(fluidError)
         return
-
     end
 
     --------------------------------------------------
-    -- CHECK INVENTORIES
+    -- INVENTORY CHECKS
     --------------------------------------------------
 
     if countItems(rawBooks) < quantity then
-
         showError("Not enough raw books")
         return
-
     end
 
     if not inventoryEmpty(inputRawBooks) then
-
         showError("Input raw books not empty")
         return
-
     end
 
     if not inventoryEmpty(printedBooks) then
-
         showError("Printed buffer not empty")
         return
-
     end
 
     --------------------------------------------------
@@ -820,17 +785,15 @@ local function printBooks(book, quantity)
     status = "LOADING"
     message = "Loading selected book..."
 
-    drawMonitor()
+    drawStatus()
 
-    local loaded, loadError = loadSelectedTemplate(
+    local loaded, err = loadSelectedTemplate(
         book.fingerprint
     )
 
     if not loaded then
-
-        showError(loadError)
+        showError(err)
         return
-
     end
 
     --------------------------------------------------
@@ -839,7 +802,7 @@ local function printBooks(book, quantity)
 
     message = "Loading raw books..."
 
-    drawMonitor()
+    drawStatus()
 
     local moved = moveItems(
         rawBooks,
@@ -848,10 +811,8 @@ local function printBooks(book, quantity)
     )
 
     if moved ~= quantity then
-
         showError("Cannot load all raw books")
         return
-
     end
 
     --------------------------------------------------
@@ -861,7 +822,7 @@ local function printBooks(book, quantity)
     local initialPrinted = countItems(printedBooks)
 
     --------------------------------------------------
-    -- START MACHINE
+    -- START PRINTING
     --------------------------------------------------
 
     machineOn()
@@ -876,11 +837,14 @@ local function printBooks(book, quantity)
 
     local startTime = os.clock()
 
-    drawMonitor()
+    drawStatus()
 
     --------------------------------------------------
-    -- WAIT FOR PRINTED BOOKS
+    -- WAIT FOR OUTPUT
     --------------------------------------------------
+
+    local lastFluidRefresh = 0
+    local lastStatusRefresh = 0
 
     while countItems(printedBooks) <
         initialPrinted + quantity do
@@ -892,20 +856,34 @@ local function printBooks(book, quantity)
             math.ceil(expectedTime - elapsed)
         )
 
-        -- Continuously monitor fluids.
+        -- Fluid readings update without redrawing the GUI.
 
-        local fluidsOK = checkFluids()
+        if elapsed - lastFluidRefresh >= CONFIG.REFRESH_RATE then
 
-        if not fluidsOK then
+            local fluidsOK = checkFluids()
 
-            showError("Fluid level too low!")
-            return
+            if not fluidsOK then
+                showError("Fluid level too low!")
+                return
+            end
+
+            drawFluids()
+
+            lastFluidRefresh = elapsed
 
         end
 
-        drawMonitor()
+        -- ETA only updates when the displayed second changes.
 
-        sleep(CONFIG.REFRESH_RATE)
+        if elapsed - lastStatusRefresh >= 1 then
+
+            drawStatus()
+
+            lastStatusRefresh = elapsed
+
+        end
+
+        sleep(0.1)
 
     end
 
@@ -916,7 +894,7 @@ local function printBooks(book, quantity)
     status = "TRANSFERRING"
     message = "Transferring printed books..."
 
-    drawMonitor()
+    drawStatus()
 
     local transferred = moveItems(
         printedBooks,
@@ -925,10 +903,8 @@ local function printBooks(book, quantity)
     )
 
     if transferred ~= quantity then
-
         showError("Output transfer incomplete")
         return
-
     end
 
     --------------------------------------------------
@@ -940,14 +916,14 @@ local function printBooks(book, quantity)
 
     machineOff()
 
-    drawMonitor()
+    drawStatus()
 
     sleep(CONFIG.RESET_DURATION)
 
     machineOn()
 
     --------------------------------------------------
-    -- PRODUCTION COMPLETED
+    -- FINISHED
     --------------------------------------------------
 
     status = "READY"
@@ -957,12 +933,15 @@ local function printBooks(book, quantity)
     busy = false
 
     refreshCatalogue()
-    drawMonitor()
+
+    drawBooks()
+    drawFluids()
+    drawStatus()
 
 end
 
 --------------------------------------------------
--- TOUCHSCREEN INPUT
+-- TOUCHSCREEN
 --------------------------------------------------
 
 local function handleTouch(x, y)
@@ -971,16 +950,12 @@ local function handleTouch(x, y)
         return
     end
 
-    refreshCatalogue()
-
     --------------------------------------------------
     -- BOOK SELECTION
     --------------------------------------------------
 
-    local firstBookY = UI.bookStart
-    local lastBookY = UI.bookStart + UI.visibleBooks - 1
-
-    if y >= firstBookY and y <= lastBookY then
+    if y >= UI.bookStart and
+        y < UI.bookStart + UI.visibleBooks then
 
         local index = y - UI.bookStart + 1 + scrollOffset
 
@@ -993,7 +968,8 @@ local function handleTouch(x, y)
             status = "READY"
             message = "Book selected"
 
-            drawMonitor()
+            drawBooks()
+            drawStatus()
 
         end
 
@@ -1002,7 +978,7 @@ local function handleTouch(x, y)
     end
 
     --------------------------------------------------
-    -- SCROLLING
+    -- SCROLL
     --------------------------------------------------
 
     if y == UI.scroll then
@@ -1017,38 +993,39 @@ local function handleTouch(x, y)
         else
 
             scrollOffset = math.min(
-                math.max(0, #catalogue - UI.visibleBooks),
+                math.max(
+                    0,
+                    #catalogue - UI.visibleBooks
+                ),
                 scrollOffset + 1
             )
 
         end
 
-        drawMonitor()
+        drawBooks()
 
         return
 
     end
 
     --------------------------------------------------
-    -- QUANTITY SELECTION
+    -- QUANTITY
     --------------------------------------------------
 
-    if y == UI.quantity then
+    if y >= UI.quantityTitle and
+        y <= UI.quantity then
 
-        local buttonWidth = math.floor(
-            W / CONFIG.MAX_BOOKS
-        )
+        local buttonWidth = math.floor(W / 5)
 
         local quantity = math.floor(
             (x - 1) / buttonWidth
         ) + 1
 
-        if quantity >= 1 and
-            quantity <= CONFIG.MAX_BOOKS then
+        if quantity >= 1 and quantity <= 5 then
 
             selectedQuantity = quantity
 
-            drawMonitor()
+            drawQuantity()
 
         end
 
@@ -1060,39 +1037,32 @@ local function handleTouch(x, y)
     -- START PRINTING
     --------------------------------------------------
 
-    if y == UI.print then
+    if y >= UI.print and y <= UI.print + 1 then
 
         if not selectedBook then
-
             showError("Select a book first")
             return
-
         end
+
+        refreshCatalogue()
 
         local selected = nil
 
         for _, book in ipairs(catalogue) do
 
             if book.fingerprint == selectedBook then
-
                 selected = book
                 break
-
             end
 
         end
 
         if not selected then
-
             showError("Selected book unavailable")
             return
-
         end
 
-        printBooks(
-            selected,
-            selectedQuantity
-        )
+        printBooks(selected, selectedQuantity)
 
         return
 
@@ -1101,7 +1071,7 @@ local function handleTouch(x, y)
 end
 
 --------------------------------------------------
--- STARTUP DISPLAY
+-- INITIAL SCREEN
 --------------------------------------------------
 
 refreshCatalogue()
@@ -1112,7 +1082,7 @@ message = "Select a book"
 drawMonitor()
 
 --------------------------------------------------
--- MAIN EVENT LOOP
+-- MAIN LOOP
 --------------------------------------------------
 
 local refreshTimer = os.startTimer(
@@ -1123,25 +1093,13 @@ while true do
 
     local event, p1, p2, p3 = os.pullEvent()
 
-    --------------------------------------------------
-    -- MONITOR TOUCH
-    --------------------------------------------------
-
     if event == "monitor_touch" then
 
-        local side = p1
-        local x = p2
-        local y = p3
+        if p1 == peripheralName("monitor") then
 
-        if side == peripheralName("monitor") then
-
-            handleTouch(x, y)
+            handleTouch(p2, p3)
 
         end
-
-    --------------------------------------------------
-    -- MONITOR RESIZE
-    --------------------------------------------------
 
     elseif event == "monitor_resize" then
 
@@ -1149,14 +1107,10 @@ while true do
 
         drawMonitor()
 
-    --------------------------------------------------
-    -- AUTOMATIC REFRESH
-    --------------------------------------------------
-
     elseif event == "timer" and p1 == refreshTimer then
 
         if not busy then
-            drawMonitor()
+            drawFluids()
         end
 
         refreshTimer = os.startTimer(
